@@ -1,0 +1,44 @@
+{
+  "id": "https://example.com/",
+  "loadingExperience": {
+    "id": "https://example.com/",
+    "metrics": {
+      "LARGEST_CONTENTFUL_PAINT_MS": { "percentile": 2100, "category": "FAST" },
+      "CUMULATIVE_LAYOUT_SHIFT_SCORE": { "percentile": 7, "category": "FAST" },
+      "INTERACTION_TO_NEXT_PAINT": { "percentile": 180, "category": "FAST" },
+      "EXPERIMENTAL_TIME_TO_FIRST_BYTE": { "percentile": 640, "category": "FAST" }
+    },
+    "overall_category": "FAST"
+  },
+  "lighthouseResult": {
+    "requestedUrl": "https://example.com/",
+    "finalUrl": "https://example.com/",
+    "lighthouseVersion": "12.6.0",
+    "categories": { "performance": { "id": "performance", "score": 0.87 } },
+    "audits": {
+      "largest-contentful-paint": { "id": "largest-contentful-paint", "numericValue": 2843.6, "score": 0.81 },
+      "cumulative-layout-shift": { "id": "cumulative-layout-shift", "numericValue": 0.0421, "score": 0.99 },
+      "total-blocking-time": { "id": "total-blocking-time", "numericValue": 187.5, "score": 0.91 },
+      "first-contentful-paint": { "id": "first-contentful-paint", "numericValue": 1512.2, "score": 0.96 },
+      "speed-index": { "id": "speed-index", "numericValue": 3120.9, "score": 0.93 },
+      "server-response-time": { "id": "server-response-time", "numericValue": 212.4, "score": 1 },
+      "unused-javascript": {
+        "id": "unused-javascript", "title": "Reduce unused JavaScript", "score": 0.5,
+        "details": { "type": "opportunity", "overallSavingsMs": 450 }
+      },
+      "render-blocking-resources": {
+        "id": "render-blocking-resources", "title": "Eliminate render-blocking resources", "score": 0.4,
+        "details": { "type": "opportunity", "overallSavingsMs": 780.4 }
+      },
+      "modern-image-formats": {
+        "id": "modern-image-formats", "title": "Serve images in next-gen formats", "score": 1,
+        "details": { "type": "opportunity", "overallSavingsMs": 0 }
+      },
+      "uses-text-compression": {
+        "id": "uses-text-compression", "title": "Enable text compression", "score": 0.7,
+        "details": { "type": "opportunity", "overallSavingsMs": 120 }
+      },
+      "dom-size": { "id": "dom-size", "title": "Avoid an excessive DOM size", "score": 0.5, "details": { "type": "table" } }
+    }
+  }
+}
