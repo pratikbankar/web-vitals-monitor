@@ -9,6 +9,8 @@ const siteSchema = new Schema(
     name: { type: String, required: true },
     /** Example sites that visitors cannot change. */
     pinned: { type: Boolean, default: false },
+    /** When an audit was last started per device. Claimed atomically to enforce the cooldown. */
+    lastAttempt: { mobile: Date, desktop: Date },
     budget: {
       performance: Number,
       lcp: Number,

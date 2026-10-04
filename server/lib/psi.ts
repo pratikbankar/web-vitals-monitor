@@ -33,8 +33,10 @@ const cannotAudit = (reason?: string) =>
 export function parsePsi(json: unknown): AuditResult {
   const lh = (json as Json | null)?.lighthouseResult as Json | undefined;
   const score = lh?.categories?.performance?.score;
-  if (!lh || typeof score !== 'number') {
-    throw cannotAudit(lh?.runtimeError?.message);
+  const runtimeError = lh?.runtimeError as { code?: string; message?: string } | undefined;
+  const errored = Boolean(runtimeError?.code) && runtimeError?.code !== 'NO_ERROR';
+  if (!lh || typeof score !== 'number' || errored) {
+    throw cannotAudit(runtimeError?.message);
   }
 
   const audits = (lh.audits ?? {}) as Json;
@@ -58,22 +60,36 @@ export function parsePsi(json: unknown): AuditResult {
     ttfb: pct('EXPERIMENTAL_TIME_TO_FIRST_BYTE'),
   };
 
+  // Older Lighthouse versions report one overall saving per "opportunity"; newer ones report
+  // savings per metric on "insight" audits. Both are read, as the time saved on FCP or LCP.
+  const savingOf = (a: Json): number => {
+    if (a?.details?.type === 'opportunity') return Number(a.details.overallSavingsMs) || 0;
+    if (typeof a?.score === 'number' && a.score < 1 && a.metricSavings) {
+      return Math.max(0, Number(a.metricSavings.LCP) || 0, Number(a.metricSavings.FCP) || 0);
+    }
+    return 0;
+  };
   const opportunities: Opportunity[] = Object.values(audits)
-    .filter((a: Json) => a?.details?.type === 'opportunity' && a.details.overallSavingsMs > 0)
-    .map((a: Json) => ({ id: String(a.id), title: String(a.title), savingsMs: Math.round(a.details.overallSavingsMs) }))
+    .filter(Boolean)
+    .map((a: Json) => ({ id: String(a.id), title: String(a.title), savingsMs: Math.round(savingOf(a)) }))
+    .filter((o) => o.savingsMs > 0)
     .sort((a, b) => b.savingsMs - a.savingsMs)
     .slice(0, 6);
 
+  const lab = {
+    lcp: ms('largest-contentful-paint'),
+    cls: typeof cls === 'number' ? Math.round(cls * 1000) / 1000 : null,
+    tbt: ms('total-blocking-time'),
+    fcp: ms('first-contentful-paint'),
+    si: ms('speed-index'),
+    ttfb: ms('server-response-time'),
+  };
+  // A score with no measurements behind it is a failed run, not a slow page.
+  if (Object.values(lab).every((v) => v === null)) throw cannotAudit();
+
   return {
     performance: Math.round(score * 100),
-    lab: {
-      lcp: ms('largest-contentful-paint'),
-      cls: typeof cls === 'number' ? Math.round(cls * 1000) / 1000 : null,
-      tbt: ms('total-blocking-time'),
-      fcp: ms('first-contentful-paint'),
-      si: ms('speed-index'),
-      ttfb: ms('server-response-time'),
-    },
+    lab,
     field: Object.values(field).some((v) => v !== null) ? field : null,
     opportunities,
   };
@@ -88,22 +104,29 @@ export const runPsi: RunPsi = async (url, strategy) => {
   const params = new URLSearchParams({ url, strategy, category: 'performance' });
   if (process.env.PSI_API_KEY) params.set('key', process.env.PSI_API_KEY);
 
+  const unavailable = () => new AppError(502, 'audit_unavailable', 'The audit service is unavailable. Please try again.');
+
   let res: Response;
   try {
     res = await fetch(`${ENDPOINT}?${params}`, { signal: AbortSignal.timeout(55000) });
-  } catch {
-    throw new AppError(504, 'audit_timeout', 'The audit took too long. Please try again.');
+  } catch (err) {
+    const timedOut = err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError');
+    throw timedOut ? new AppError(504, 'audit_timeout', 'The audit took too long. Please try again.') : unavailable();
   }
   const body = (await res.json().catch(() => null)) as Json | null;
   if (res.status === 429) {
     throw new AppError(503, 'audit_quota', 'The audit service is busy right now. Please try again in a few minutes.');
   }
+  if (res.status === 401 || res.status === 403) {
+    // A missing key, a disabled API or a spent daily quota: our problem, not the visitor's page.
+    console.error('PageSpeed Insights rejected the request:', res.status, body?.error?.message);
+    throw new AppError(503, 'audit_unavailable', 'Audits are temporarily unavailable. Please try again later.');
+  }
+  if (res.status >= 500) throw unavailable();
   if (!res.ok) {
     // Google explains unreachable or invalid pages in error.message; it is safe to show.
     const reason = String(body?.error?.message ?? '').split('\n')[0].slice(0, 200);
-    throw res.status >= 500
-      ? new AppError(502, 'audit_unavailable', 'The audit service is unavailable. Please try again.')
-      : cannotAudit(reason || undefined);
+    throw cannotAudit(reason || undefined);
   }
   return parsePsi(body);
 };

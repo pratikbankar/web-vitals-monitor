@@ -34,6 +34,8 @@ false alarms. Instead:
 - The score must drop by 10 points or more.
 - A timing metric (LCP, FCP, TBT) must be worse by 20 percent **and** by a minimum absolute
   amount (300 ms, or 100 ms for TBT), so fast pages do not flap over a few milliseconds.
+- A blocking time that is still rated good (200 ms or less) is never flagged, because TBT
+  often sits at zero and any rise from zero looks large.
 - CLS must worsen by 0.05 or more.
 
 The rules are pure functions in [`server/lib/rules.ts`](server/lib/rules.ts) with tests in
@@ -83,6 +85,8 @@ For real audits and persistent data, copy `.env.example` to `.env` and set `PSI_
 | `PUT /api/sites/:id/budget` | Set the performance budget |
 | `DELETE /api/sites/:id` | Remove a site (needs `x-admin-key`) |
 | `GET /api/badge/:id.svg` | Status badge (`?strategy=desktop` for desktop) |
+| `GET /api/cron/daily` | Re-audit every site (needs the cron secret) |
+| `GET /api/health` | Liveness check |
 
 Errors always look like `{ "error": { "code": "...", "message": "..." } }`.
 
@@ -106,9 +110,13 @@ docs/superpowers/   Design spec and implementation plan
 
 - **The server never fetches a submitted URL.** It only passes the address to Google, which
   removes server-side request forgery as a risk. Private and local addresses are rejected anyway.
-- **The public demo has no accounts**, so it is protected by limits instead: at most 12 sites,
-  one audit per site and device every 5 minutes, and per-visitor rate limits. Example sites
-  are pinned and cannot be changed without an admin key.
+- **The public demo has no accounts**, so it is protected by limits instead. At most 12 sites
+  are tracked; when it is full, adding a site replaces the oldest visitor-added one. Each site
+  and device can be audited once every 5 minutes, enforced with an atomic claim in the
+  database so simultaneous requests cannot each call Google. Example sites are pinned and
+  cannot be changed without an admin key.
+- **Per-visitor rate limits are best effort.** They are counted in memory per server instance,
+  which is approximate on serverless hosting. The database cooldown above is the real guard.
 - **A failed audit stores nothing.** Quota errors, timeouts and unreachable pages return a
   readable message and the visitor can retry.
 - **Badges never break.** An unknown site or a site without audits gets a valid "no data" badge.

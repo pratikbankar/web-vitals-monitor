@@ -35,6 +35,8 @@ const RELATIVE_WORSE = 0.2;
 /** A timing metric must also be worse by this many ms, so tiny pages do not flap. */
 const ABSOLUTE_WORSE_MS: Record<'lcp' | 'fcp' | 'tbt', number> = { lcp: 300, fcp: 300, tbt: 100 };
 const CLS_WORSE = 0.05;
+/** Blocking time often sits at zero, so a rise that is still rated good (200 ms or less) is not news. */
+const TBT_GOOD = 200;
 
 function median(values: number[]): number {
   const sorted = [...values].sort((a, b) => a - b);
@@ -68,6 +70,7 @@ export function detectRegressions(previous: RunMetrics[], current: RunMetrics): 
     const baseline = baselineOf(metric);
     const value = current.lab[metric];
     if (baseline === null || value === null) continue;
+    if (metric === 'tbt' && value <= TBT_GOOD) continue;
     const worseBy = value - baseline;
     if (worseBy >= ABSOLUTE_WORSE_MS[metric] && worseBy >= baseline * RELATIVE_WORSE) {
       found.push({ metric, baseline, value });

@@ -14,6 +14,10 @@ import { Run, Site } from './models.js';
 
 const MAX_SITES = 12;
 const COOLDOWN_MS = 5 * 60 * 1000;
+/** After a failed audit the visitor may retry sooner, but not in a tight loop. */
+const RETRY_AFTER_FAILURE_MS = 60 * 1000;
+/** The daily job stops starting new audits after this long, to finish inside the function limit. */
+const CRON_BUDGET_MS = 230 * 1000;
 const HISTORY_PER_STRATEGY = 60;
 const HOUR = 60 * 60 * 1000;
 const STRATEGIES: Strategy[] = ['mobile', 'desktop'];
@@ -101,10 +105,19 @@ export function createApp({ runPsi = realRunPsi }: { runPsi?: RunPsi } = {}): Ex
         return;
       }
       if ((await Site.countDocuments()) >= MAX_SITES) {
-        throw new AppError(409, 'site_limit', `This demo tracks at most ${MAX_SITES} sites. Remove one or try again later.`);
+        // Make room rather than leave the demo full for every later visitor.
+        const oldest = await Site.findOne({ pinned: false }).sort({ createdAt: 1 });
+        if (!oldest) throw new AppError(409, 'site_limit', 'This demo is full of example sites, so no more can be added.');
+        await Promise.all([Run.deleteMany({ siteId: oldest._id }), oldest.deleteOne()]);
       }
-      const site = await Site.create({ url, name: body.name || new URL(url).hostname });
-      res.status(201).json(site.toObject());
+      try {
+        const site = await Site.create({ url, name: body.name || new URL(url).hostname });
+        res.status(201).json(site.toObject());
+      } catch (err) {
+        // Someone else added the same address at the same moment: the unique index kept one copy.
+        if ((err as { code?: number }).code !== 11000) throw err;
+        res.json(await Site.findOne({ url }).lean());
+      }
     }),
   );
 
@@ -127,13 +140,27 @@ export function createApp({ runPsi = realRunPsi }: { runPsi?: RunPsi } = {}): Ex
     ah(async (req, res) => {
       const site = await findSite(req.params.id);
       const { strategy } = parse(auditBody, req.body);
-      const last = await latestRun(site._id, strategy);
-      const wait = last ? COOLDOWN_MS - (Date.now() - new Date(last.createdAt).getTime()) : 0;
-      if (wait > 0) {
+      // Claim the slot in one atomic step, before calling Google, so simultaneous requests
+      // (and repeated failures) cannot each trigger an audit.
+      const field = `lastAttempt.${strategy}`;
+      const now = Date.now();
+      const claimed = await Site.findOneAndUpdate(
+        { _id: site._id, $or: [{ [field]: { $exists: false } }, { [field]: null }, { [field]: { $lte: new Date(now - COOLDOWN_MS) } }] },
+        { $set: { [field]: new Date(now) } },
+      );
+      if (!claimed) {
+        const last = (await Site.findById(site._id).lean())?.lastAttempt?.[strategy];
+        const wait = Math.max(1000, COOLDOWN_MS - (now - new Date(last ?? now).getTime()));
         const minutes = Math.ceil(wait / 60000);
+        res.set('Retry-After', String(Math.ceil(wait / 1000)));
         throw new AppError(429, 'cooldown', `This site was audited moments ago. Try again in ${minutes} minute${minutes === 1 ? '' : 's'}.`);
       }
-      res.status(201).json(await auditSite(site, strategy, runPsi));
+      try {
+        res.status(201).json(await auditSite(site, strategy, runPsi));
+      } catch (err) {
+        await Site.updateOne({ _id: site._id }, { $set: { [field]: new Date(now - COOLDOWN_MS + RETRY_AFTER_FAILURE_MS) } });
+        throw err;
+      }
     }),
   );
 
@@ -186,15 +213,25 @@ export function createApp({ runPsi = realRunPsi }: { runPsi?: RunPsi } = {}): Ex
 
       const sites = await Site.find().lean();
       const jobs = sites.flatMap((site) => STRATEGIES.map((strategy) => ({ site, strategy })));
+      const started = Date.now();
       let audited = 0;
       let failed = 0;
+      let done = 0;
       // A few at a time: fast enough to finish within the function limit, gentle on the audit quota.
-      for (let i = 0; i < jobs.length; i += 4) {
-        const results = await Promise.allSettled(jobs.slice(i, i + 4).map((j) => auditSite(j.site, j.strategy, runPsi)));
-        audited += results.filter((r) => r.status === 'fulfilled').length;
-        failed += results.filter((r) => r.status === 'rejected').length;
+      for (let i = 0; i < jobs.length && Date.now() - started < CRON_BUDGET_MS; i += 6) {
+        const batch = jobs.slice(i, i + 6);
+        const results = await Promise.allSettled(batch.map((j) => auditSite(j.site, j.strategy, runPsi)));
+        done += batch.length;
+        results.forEach((r, n) => {
+          if (r.status === 'fulfilled') audited += 1;
+          else {
+            failed += 1;
+            if (process.env.NODE_ENV !== 'test') console.error('Daily audit failed:', batch[n].site.url, batch[n].strategy, String(r.reason));
+          }
+        });
       }
-      res.json({ audited, failed });
+      const skipped = jobs.length - done;
+      res.json({ audited, failed, ...(skipped ? { skipped } : {}) });
     }),
   );
 

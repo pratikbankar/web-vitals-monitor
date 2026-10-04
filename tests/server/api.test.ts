@@ -31,6 +31,8 @@ afterAll(async () => {
 });
 beforeEach(async () => {
   await mongoose.connection.dropDatabase();
+  // Dropping the database drops the unique index too; the app relies on it.
+  await Promise.all([Site.createIndexes(), Run.createIndexes()]);
   runPsi.mockReset();
   runPsi.mockImplementation(async () => result());
   app = createApp({ runPsi });
@@ -77,8 +79,33 @@ describe('sites', () => {
     expect((await request(app).post('/api/sites').send({ url: { $gt: '' } })).status).toBe(400);
   });
 
-  it('stops at twelve sites', async () => {
-    for (let i = 0; i < 12; i++) await Site.create({ url: `https://site${i}.example.com/`, name: `s${i}` });
+  it('returns one site, never an error, when the same address is added by several people at once', async () => {
+    const variants = ['https://race.example.com', 'HTTPS://RACE.EXAMPLE.COM/', 'race.example.com/#x', 'https://race.example.com/'];
+    const results = await Promise.all(variants.map((url) => request(app).post('/api/sites').send({ url })));
+    expect(results.map((r) => r.status).sort()).toEqual([200, 200, 200, 201]);
+    expect(new Set(results.map((r) => r.body._id)).size).toBe(1);
+    expect(await Site.countDocuments()).toBe(1);
+  });
+
+  it('makes room by dropping the oldest visitor-added site when the demo is full', async () => {
+    for (let i = 0; i < 4; i++) await Site.create({ url: `https://pinned${i}.example.com/`, name: `p${i}`, pinned: true });
+    const added: string[] = [];
+    for (let i = 0; i < 8; i++) {
+      const site = await Site.create({ url: `https://site${i}.example.com/`, name: `s${i}`, createdAt: new Date(Date.now() - (100 - i) * 60000) });
+      added.push(String(site._id));
+    }
+    await seedRun(added[0], 80, 30);
+
+    const res = await request(app).post('/api/sites').send({ url: 'https://one-more.example.com' });
+    expect(res.status).toBe(201);
+    expect(await Site.countDocuments()).toBe(12);
+    expect(await Site.findById(added[0])).toBeNull();
+    expect(await Run.countDocuments({ siteId: added[0] })).toBe(0);
+    expect(await Site.countDocuments({ pinned: true })).toBe(4);
+  });
+
+  it('refuses a new site only when every slot is a pinned example', async () => {
+    for (let i = 0; i < 12; i++) await Site.create({ url: `https://site${i}.example.com/`, name: `s${i}`, pinned: true });
     const res = await request(app).post('/api/sites').send({ url: 'https://one-more.example.com' });
     expect(res.status).toBe(409);
     expect(res.body.error.code).toBe('site_limit');
@@ -133,14 +160,31 @@ describe('audits', () => {
     expect(runPsi).toHaveBeenCalledTimes(2);
   });
 
-  it('stores nothing and allows a retry when the audit fails', async () => {
+  it('stores nothing when the audit fails, and allows a retry after a minute', async () => {
     const site = await addSite();
     runPsi.mockRejectedValueOnce(new AppError(503, 'audit_quota', 'The audit service is busy right now.'));
     const failed = await audit(site._id);
     expect(failed.status).toBe(503);
     expect(failed.body.error.code).toBe('audit_quota');
     expect(await Run.countDocuments()).toBe(0);
+
+    // A failing page must not be a way to call Google in a tight loop.
+    const tooSoon = await audit(site._id);
+    expect(tooSoon.status).toBe(429);
+    expect(tooSoon.body.error.message).toMatch(/1 minute/);
+    expect(tooSoon.headers['retry-after']).toBeDefined();
+    expect(runPsi).toHaveBeenCalledTimes(1);
+
+    await Site.updateOne({ _id: site._id }, { $set: { 'lastAttempt.mobile': new Date(Date.now() - 5 * 60000 - 1000) } });
     expect((await audit(site._id)).status).toBe(201);
+  });
+
+  it('runs only one audit when several requests for the same site arrive together', async () => {
+    const site = await addSite();
+    const results = await Promise.all([1, 2, 3, 4, 5].map(() => audit(site._id)));
+    expect(results.map((r) => r.status).sort()).toEqual([201, 429, 429, 429, 429]);
+    expect(runPsi).toHaveBeenCalledTimes(1);
+    expect(await Run.countDocuments()).toBe(1);
   });
 
   it('reports an unexpected audit error without leaking details', async () => {

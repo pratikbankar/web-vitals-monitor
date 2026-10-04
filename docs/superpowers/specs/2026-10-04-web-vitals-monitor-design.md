@@ -33,7 +33,7 @@ The server never fetches a user-supplied URL itself; it only passes the URL to G
 - Regression: compared with the median of the previous 5 runs of the same strategy; needs at
   least 3 earlier runs. Flag when performance drops 10 points or more; when lcp, fcp or tbt is
   20 percent or more worse and worse by at least 300 ms (100 ms for tbt); when cls is worse by
-  0.05 or more.
+  0.05 or more. A tbt that is still 200 ms or less is never flagged.
 - Budget: performance is a minimum; lcp, cls, tbt are maximums. No budget set means status none.
 - Web Vitals ratings: LCP good up to 2500 ms, poor over 4000; CLS 0.1 and 0.25; TBT 200 and 600;
   FCP 1800 and 3000; INP 200 and 500; TTFB 800 and 1800. Score good from 90, poor under 50.
@@ -41,9 +41,9 @@ The server never fetches a user-supplied URL itself; it only passes the URL to G
 ## API
 
 - `GET /api/sites`: sites with their latest run per strategy.
-- `POST /api/sites { url, name? }`: add a site. Only http(s) public hostnames. At most 12 sites.
+- `POST /api/sites { url, name? }`: add a site. Only http(s) public hostnames. At most 12 sites; when full, the oldest non-pinned site is replaced.
 - `GET /api/sites/:id`: site and its last 60 runs per strategy.
-- `POST /api/sites/:id/audit { strategy }`: run an audit now. One per site and strategy every 5 minutes.
+- `POST /api/sites/:id/audit { strategy }`: run an audit now. One per site and strategy every 5 minutes (1 minute after a failed audit), claimed atomically.
 - `PUT /api/sites/:id/budget`: set the budget. Pinned sites need the admin key.
 - `DELETE /api/sites/:id`: admin key required (`x-admin-key`).
 - `GET /api/badge/:id.svg?strategy=`: status badge image.

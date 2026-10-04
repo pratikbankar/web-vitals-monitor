@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { renderBadge } from '../../server/lib/badge.js';
-import { parsePsi } from '../../server/lib/psi.js';
+import { parsePsi, runPsi } from '../../server/lib/psi.js';
 import { detectRegressions, evaluateBudget, type RunMetrics } from '../../server/lib/rules.js';
 import { normalizeUrl } from '../../server/lib/url.js';
 
@@ -39,6 +39,32 @@ describe('parsePsi', () => {
     expect(r.lab.lcp).toBe(2844);
   });
 
+  it('reads improvement suggestions from newer Lighthouse versions, which report savings per metric', () => {
+    const audits = {
+      ...fixture.lighthouseResult.audits,
+      'unused-javascript': undefined, 'render-blocking-resources': undefined, 'uses-text-compression': undefined,
+      'render-blocking-insight': { id: 'render-blocking-insight', title: 'Render blocking requests', score: 0, metricSavings: { FCP: 300, LCP: 650 }, details: { type: 'table' } },
+      'image-delivery-insight': { id: 'image-delivery-insight', title: 'Improve image delivery', score: 0.5, metricSavings: { LCP: 200 }, details: { type: 'table' } },
+      'font-display-insight': { id: 'font-display-insight', title: 'Font display', score: 1, metricSavings: { FCP: 900 }, details: { type: 'table' } },
+      'cls-culprits-insight': { id: 'cls-culprits-insight', title: 'Layout shift culprits', score: 0, metricSavings: { CLS: 0.2 }, details: { type: 'table' } },
+    };
+    const r = parsePsi({ ...fixture, lighthouseResult: { ...fixture.lighthouseResult, audits } });
+    expect(r.opportunities).toEqual([
+      { id: 'render-blocking-insight', title: 'Render blocking requests', savingsMs: 650 },
+      { id: 'image-delivery-insight', title: 'Improve image delivery', savingsMs: 200 },
+    ]);
+  });
+
+  it('refuses a result where Lighthouse reported a runtime error or measured nothing', () => {
+    const lh = fixture.lighthouseResult;
+    const errored = { ...fixture, lighthouseResult: { ...lh, runtimeError: { code: 'NO_FCP', message: 'The page did not paint any content' }, categories: { performance: { score: 0 } } } };
+    expect(() => parsePsi(errored)).toThrow(/did not paint/);
+    const empty = { ...fixture, lighthouseResult: { ...lh, categories: { performance: { score: 0 } }, audits: {} } };
+    expect(() => parsePsi(empty)).toThrow(/could not audit/i);
+    const fine = { ...fixture, lighthouseResult: { ...lh, runtimeError: { code: 'NO_ERROR', message: '' } } };
+    expect(parsePsi(fine).performance).toBe(87);
+  });
+
   it('fails with a readable error when the page could not be audited', () => {
     const broken = { lighthouseResult: { runtimeError: { code: 'ERRORED_DOCUMENT_REQUEST', message: 'Status 404' }, categories: { performance: { score: null } }, audits: {} } };
     expect(() => parsePsi(broken)).toThrow(/could not audit/i);
@@ -70,6 +96,13 @@ describe('detectRegressions', () => {
     expect(detectRegressions(fast, run({ lab: { fcp: 600 } }))).toEqual([]);
     expect(detectRegressions(steady, run({ lab: { lcp: 2500 } }))).toEqual([{ metric: 'lcp', baseline: 2000, value: 2500 }]);
     expect(detectRegressions(steady, run({ lab: { tbt: 260 } }))).toEqual([{ metric: 'tbt', baseline: 150, value: 260 }]);
+  });
+
+  it('does not call a blocking time that is still good a regression, even from a baseline of zero', () => {
+    const idle = [1, 2, 3, 4].map(() => run({ lab: { tbt: 0 } }));
+    expect(detectRegressions(idle, run({ lab: { tbt: 150 } }))).toEqual([]);
+    expect(detectRegressions(idle, run({ lab: { tbt: 200 } }))).toEqual([]);
+    expect(detectRegressions(idle, run({ lab: { tbt: 450 } }))).toEqual([{ metric: 'tbt', baseline: 0, value: 450 }]);
   });
 
   it('flags a layout shift that worsens by 0.05 or more', () => {
@@ -154,5 +187,55 @@ describe('normalizeUrl', () => {
       'http://intranet', 'https://user:pass@example.com', 'http://0.0.0.0', 'https://example.com:8443/' + 'a'.repeat(600),
     ];
     for (const input of bad) expect(() => normalizeUrl(input), input).toThrow();
+  });
+});
+
+describe('runPsi', () => {
+  afterEach(() => vi.unstubAllGlobals());
+  const respond = (status: number, body: unknown) =>
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(typeof body === 'string' ? body : JSON.stringify(body), { status })));
+  const failure = async () => runPsi('https://example.com/', 'mobile').then(() => null, (e: { status: number; code: string; message: string }) => e);
+
+  it('returns the parsed audit and passes the page and device to Google', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify(fixture), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    expect((await runPsi('https://example.com/a?b=1', 'desktop')).performance).toBe(87);
+    const called = new URL(String((fetchMock.mock.calls[0] as unknown[])[0]));
+    expect(called.hostname).toBe('www.googleapis.com');
+    expect(called.searchParams.get('url')).toBe('https://example.com/a?b=1');
+    expect(called.searchParams.get('strategy')).toBe('desktop');
+  });
+
+  it('reports a busy or misconfigured audit service as unavailable, not as a problem with the page', async () => {
+    respond(429, { error: { message: 'Quota exceeded' } });
+    expect(await failure()).toMatchObject({ status: 503, code: 'audit_quota' });
+    for (const status of [401, 403]) {
+      respond(status, { error: { message: 'API key not valid. Please pass a valid API key.' } });
+      const err = await failure();
+      expect(err).toMatchObject({ status: 503, code: 'audit_unavailable' });
+      expect(err!.message).not.toMatch(/API key/);
+    }
+    respond(500, 'oops');
+    expect(await failure()).toMatchObject({ status: 502, code: 'audit_unavailable' });
+  });
+
+  it('passes on Google\'s explanation when the page itself cannot be audited', async () => {
+    respond(400, { error: { message: 'Lighthouse returned error: FAILED_DOCUMENT_REQUEST. Details: net::ERR_NAME_NOT_RESOLVED\nmore' } });
+    const err = await failure();
+    expect(err).toMatchObject({ status: 422, code: 'audit_failed' });
+    expect(err!.message).toContain('FAILED_DOCUMENT_REQUEST');
+    expect(err!.message).not.toContain('more');
+  });
+
+  it('tells a timeout apart from a network failure', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new DOMException('timed out', 'TimeoutError'); }));
+    expect(await failure()).toMatchObject({ status: 504, code: 'audit_timeout' });
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('fetch failed'); }));
+    expect(await failure()).toMatchObject({ status: 502, code: 'audit_unavailable' });
+  });
+
+  it('handles a success response that is not JSON', async () => {
+    respond(200, '<html>');
+    expect(await failure()).toMatchObject({ status: 422, code: 'audit_failed' });
   });
 });
